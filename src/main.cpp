@@ -1,24 +1,92 @@
 #include "global.h"
-
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SPI.h>
 #include <LoRa.h>
-#include <Preferences.h>
+#include "driver/rtc_io.h"
+#include <LittleFS.h>
+
+#ifndef PIN_BUTTON
+#include <keyboard.h>
+#endif
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire);
-Preferences preferences;
-
-// message:  receiverIdx or -1|senderIdx|text
 
 bool isBuzzing = false;
-bool isSending = false;
+bool isWakeMsg = false;
 unsigned long beepStartMillis = 0;
 unsigned long sendStartMillis = 0;
-int selectedUserIdx = OTHER_IDX;
-int myUserIdx = MY_IDX;
-std::vector<String> users;
+unsigned long idleMillis = 0;
+std::vector<Account> users;
+std::vector<Message> messages;
+
+#ifdef PIN_BUTTON
+String myName = "Bar";
+String targetName = "Foo";
+#else
+String myName = "Foo";
+String targetName = "Bar";
+#endif
+
+String buff = "";
+volatile bool isIncomeMsg = false;
+
+void setupFileSystem() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("An error has occurred while mounting LittleFS");
+  }
+}
+
+void saveMessagesToFile(const std::vector<Message>& messages, const char* filename) {
+  if (!LittleFS.exists(filename)) {
+    Serial.println("File does not exist. Creating file...");
+  }
+
+  File file = LittleFS.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to create file!");
+    return;
+  }
+
+  for (const auto& msg : messages) {
+    String line = msg.id + "," + msg.from + "," + msg.to + "," + String(msg.status) + "," + msg.text + SEPARATOR + String(msg.sentAt) + "\n";
+    file.print(line);
+  }
+  file.close();
+  Serial.println("Messages saved to file.");
+}
+
+void loadMessagesFromFile(std::vector<Message>& messages, const char* filename) {
+  if (!LittleFS.exists(filename)) {
+    Serial.println("File not found!");
+    return;
+  }
+
+  File file = LittleFS.open(filename, FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open file for reading!");
+    return;
+  }
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    Message msg;
+    sscanf(line.c_str(), "%[^,],%[^,],%[^,],%d,%[^,],%lu", msg.id, msg.from, msg.to, &msg.status, msg.text, &msg.sentAt);
+    messages.push_back(msg);
+    Serial.print((msg.to == BROADCAST_CHAR ? "ALL" : msg.to));
+    Serial.print("<" + msg.from);
+    Serial.print(":");
+    Serial.println(msg.text);
+  }
+  file.close();
+  Serial.println("Messages loaded from file.");
+}
+
+void onReceive(const int packetSize) {
+  if (packetSize == 0) return;
+  isIncomeMsg = true;
+}
 
 void beep(const bool enable) {
   beepStartMillis = millis();
@@ -43,99 +111,97 @@ String decrypt(const String& encryptedMessage, const String& nickname) {
   return encrypt(encryptedMessage, nickname);
 }
 
-void sendRaw(const int fromIdx, const int toIdx, const String& text) {
-  Serial.print("Sending from: ");
-  Serial.print(fromIdx);
-  Serial.print(" to: ");
-  Serial.print(toIdx);
-  Serial.print(" text: ");
-  Serial.println(text);
+void sendRaw(const String& toName, const String& id, const String& text, const bool encrypted = false) {
   LoRa.beginPacket();
-  LoRa.print(String(toIdx) + SEPARATOR + String(fromIdx) + SEPARATOR + text);
-  LoRa.endPacket();
-}
-
-
-void logMessage(const String& message) {
-  String currentLogs = preferences.getString(STORAGE_LOGS, "");
-  currentLogs += message + "\n";
-  preferences.putString(STORAGE_LOGS, currentLogs);
-}
-
-std::vector<String> splitString(const String& data, const char delimiter) {
-  std::vector<String> result;
-  int start = 0;
-  int end;
-  while ((end = data.indexOf(delimiter, start)) != -1) {
-    result.push_back(data.substring(start, end));
-    start = end + 1;
+  LoRa.print(toName);
+  LoRa.print(SEPARATOR);
+  LoRa.print(myName);
+  LoRa.print(SEPARATOR);
+  LoRa.print(id);
+  LoRa.print(SEPARATOR);
+  LoRa.print(encrypted ? encrypt(text, toName) : text);
+  LoRa.endPacket(true);
+  LoRa.receive();
+  Serial.print(myName);
+  Serial.print(">" + (toName == BROADCAST_CHAR ? "ALL" : toName));
+  Serial.print(":");
+  Serial.println(text == PING_CHAR ? "PING" : text == PONG_CHAR ? "PONG" : text == ACK_CHAR ? "ACK" : text);
+  if (encrypted) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("to " + (toName == BROADCAST_CHAR ? "ALL" : toName));
+    display.print(": ");
+    display.println(text);
+    display.display();
   }
-  if (start < data.length()) result.push_back(data.substring(start));
-  return result;
+}
+
+void createMessage(const String& receiverName, const String& text) {
+  messages.emplace_back(Message{
+    .id = static_cast<String>(random()),
+    .from = myName,
+    .to = receiverName,
+    .status = idle,
+    .text = text,
+    .sentAt = 0,
+  });
 }
 
 void receiveMessage() {
   String receivedText = "";
   while (LoRa.available()) receivedText += static_cast<char>(LoRa.read());
-  LOG("[RAW]", receivedText);
 
   const int firstSeparatorIndex = receivedText.indexOf(SEPARATOR);
   const int secondSeparatorIndex = receivedText.indexOf(SEPARATOR, firstSeparatorIndex + 1);
-  const int receiverIdx = receivedText.substring(0, firstSeparatorIndex).toInt();
-  const int senderIdx = receivedText.substring(firstSeparatorIndex + 1, secondSeparatorIndex).toInt();
-  const String message = receivedText.substring(secondSeparatorIndex + 1);
+  const int thirdSeparatorIndex = receivedText.indexOf(SEPARATOR, secondSeparatorIndex + 1);
+  const String receiverName = receivedText.substring(0, firstSeparatorIndex);
+  const String senderName = receivedText.substring(firstSeparatorIndex + 1, secondSeparatorIndex);
+  const String id = receivedText.substring(secondSeparatorIndex + 1, thirdSeparatorIndex);
+  const String payload = receivedText.substring(thirdSeparatorIndex + 1);
 
-  if (receiverIdx == myUserIdx || receiverIdx == -1) {
-    Serial.print("Received message from ");
-    Serial.print(users[senderIdx]);
-    Serial.print(": ");
-    Serial.println(message);
+  Serial.print((receiverName == BROADCAST_CHAR ? "ALL" : receiverName));
+  Serial.print("<" + senderName);
+  Serial.print(":");
+  Serial.println(payload == PING_CHAR ? "PING" : payload == PONG_CHAR ? "PONG" : payload == ACK_CHAR ? "ACK" : decrypt(payload, receiverName));
 
-    if (message == ACK_CHAR) {
-      Serial.println("ACK received!");
-      logMessage(message);
-      isSending = false;
+  // todo process all messages as net
+  if (receiverName == myName || receiverName == BROADCAST_CHAR) {
+    if (payload == ACK_CHAR) {
+      for (auto& m : messages) {
+        if (m.id == id) {
+          m.status = delivered;
+          m.sentAt = millis();
+          display.println("delivered!");
+          display.display();
+          break;
+        }
+      }
+    } else if (payload == PING_CHAR) {
+      sendRaw(senderName, "",PONG_CHAR);
+      display.println("online: " + senderName);
+      display.display();
+      for (auto& m : messages) {
+        if (m.to == senderName && m.status == fail) m.status = idle;
+      }
+    } else if (payload == PONG_CHAR) {
+      for (auto& m : messages) {
+        if (m.to == senderName && m.status == fail) m.status = idle;
+      }
+      display.println("online: " + senderName);
+      display.display();
+    } else { // new message
+      sendRaw(senderName, id, ACK_CHAR);
+      beep(true);
       display.clearDisplay();
       display.setCursor(0, 0);
-      display.println("delivered!");
+      display.print(senderName);
+      display.print(": ");
+      display.println(decrypt(payload, myName));
       display.display();
-      return;
+      idleMillis = millis();
     }
-    if (message == PING_CHAR) {
-      Serial.println("PING received!");
-      sendRaw(myUserIdx, senderIdx,PONG_CHAR);
-      Serial.println("PONG sent.");
-      return;
-    }
-    if (message == PONG_CHAR) {
-      Serial.println("PONG received!");
-      return;
-    }
-    beep(true);
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("From: " + users[senderIdx]);
-    display.println(decrypt(message, users[myUserIdx]));
-    display.display();
-    logMessage(receivedText);
-    sendRaw(myUserIdx, senderIdx, ACK_CHAR);
-    Serial.println("ACK sent.");
   }
-}
-
-void sendMessage(const int receiverIdx, const String& text) {
-  sendRaw(myUserIdx, receiverIdx, encrypt(text, users[receiverIdx]));
-  sendStartMillis = millis();
-  isSending = true;
-  Serial.print("Sent to ");
-  Serial.print(users[receiverIdx]);
-  Serial.print(": ");
-  Serial.println(text);
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("sending to: " + users[receiverIdx]);
-  display.println(text);
-  display.display();
+  isIncomeMsg = false;
 }
 
 void setupDisplay() {
@@ -150,53 +216,120 @@ void setupDisplay() {
   display.setCursor(0, 0);
   display.setTextWrap(true);
   display.cp437(true);
+  display.fillScreen(SSD1306_WHITE);
+  display.display();
+  delay(100);
+  display.clearDisplay();
   display.display();
 }
 
 void setupLoRa() {
   SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_CS);
-  LoRa.setPins(PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_IRQ);
+  LoRa.setPins(PIN_LORA_CS, -1, PIN_LORA_IRQ);
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  // pinMode(PIN_LORA_IRQ, INPUT_PULLDOWN);
+  // isWakeMsg = digitalRead(PIN_LORA_IRQ);
   if (!LoRa.begin(LORA_FRQ)) {
     Serial.println("Starting LoRa failed!");
     while (true);
   }
-  LoRa.setSyncWord(LORA_SYNC_WORD);
-  Serial.println("LoRa initialized");
+  // LoRa.setSpreadingFactor(12);
 }
 
-void setupStorage() {
-  preferences.begin(STORAGE_SCOPE, false);
-  const String storedUsers = preferences.getString(STORAGE_USERS, STORAGE_NICKS);
-  users = splitString(storedUsers, ',');
-  Serial.println("Stored Users: " + storedUsers);
-  const String storedLogs = preferences.getString(STORAGE_LOGS, "");
-  Serial.println("Stored Logs: " + storedLogs);
+void goSleep() {
+  LOG("--sleep--");
+  // saveMessagesToFile(messages, MESSAGES_FILE);
+  display.ssd1306_command(SSD1306_CHARGEPUMP); //into charger pump set mode
+  display.ssd1306_command(0x10); //turn off charger pump
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+  rtc_gpio_pullup_dis(GPIO_NUM_5);
+  rtc_gpio_pulldown_en(GPIO_NUM_5);
+  rtc_gpio_pullup_dis(GPIO_NUM_0); // ENTER btn
+  rtc_gpio_pulldown_en(GPIO_NUM_0);
+
+  esp_deep_sleep_enable_gpio_wakeup(IRQ_PIN_BITMASK(GPIO_NUM_5) | IRQ_PIN_BITMASK(GPIO_NUM_0), ESP_GPIO_WAKEUP_GPIO_HIGH);
+  esp_deep_sleep_start();
+}
+
+void updateMessages(const unsigned long curMillis) {
+  for (auto& m : messages) {
+    if (m.status == idle) {
+      m.status = sending;
+      m.sentAt = millis();
+      sendRaw(m.to, m.id, m.text, true);
+      idleMillis = curMillis;
+    } else if (m.status == sending) {
+      if (curMillis - m.sentAt >= ACK_TIMEOUT) {
+        m.sentAt = 0;
+        m.status = fail;
+        m.sentAt = curMillis;
+        display.println("not delivered!");
+        display.display();
+        idleMillis = curMillis;
+      }
+    } else if (m.status == fail) {
+      if (curMillis - m.sentAt >= RESEND_TIMEOUT + random(500)) {
+        m.sentAt = 0;
+        m.status = idle;
+        display.display();
+        idleMillis = curMillis;
+      }
+    }
+  }
 }
 
 void setup() {
   START_SERIAL
-  setupStorage();
-  setupDisplay();
   setupLoRa();
+  setupDisplay();
+  // setupFileSystem();
+  // loadMessagesFromFile(messages, MESSAGES_FILE);
   pinMode(PIN_BUZZER, OUTPUT);
+#ifdef PIN_BUTTON
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-  display.print(users[myUserIdx]);
-  display.println(" is ready!");
+#else
+  setupKeyboard();
+#endif
+  display.print(myName);
+  display.println(" ready");
   display.display();
+  LoRa.onReceive(onReceive);
+  LoRa.receive();
+  idleMillis = millis();
+  sendRaw(BROADCAST_CHAR, "",PING_CHAR);
 }
 
 void loop() {
   const unsigned long currentMillis = millis();
+  if (isIncomeMsg) receiveMessage();
+  updateMessages(currentMillis);
   if (isBuzzing && (currentMillis - beepStartMillis >= BUZZER_DURATION)) beep(false);
-  if (isSending && (currentMillis - sendStartMillis >= ACK_TIMEOUT)) {
-    Serial.println("ACK not received, message may not have been delivered.");
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("not delivered!");
-    display.display();
-    isSending = false;
+  if (currentMillis > idleMillis + IDLE_TIMEOUT) goSleep();
+  if (Serial.available()) createMessage(targetName, Serial.readString());
+#ifdef PIN_BUTTON
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    delay(50);
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      idleMillis = currentMillis;
+      buff = "TEST_MSG";
+      createMessage(targetName, buff);
+    }
   }
-  if (LoRa.parsePacket()) receiveMessage();
-  if (Serial.available()) sendMessage(selectedUserIdx, Serial.readString());
-  if (!isSending && digitalRead(PIN_BUTTON) == LOW) sendMessage(selectedUserIdx, "TEST");
+#else
+  char key = getKeyPressed();
+  if (key) {
+    idleMillis = currentMillis;
+    Serial.print(key);
+    if (key == 'Q') goSleep();
+    if (key == '\x0d') {
+      createMessage(targetName, buff);
+      buff = "";
+    } else {
+      buff += key;
+      display.print(key);
+      display.display();
+    }
+  }
+#endif
 }
